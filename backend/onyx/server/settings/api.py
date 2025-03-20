@@ -25,9 +25,7 @@ from onyx.server.settings.store import load_settings
 from onyx.server.settings.store import store_settings
 from onyx.utils.logger import setup_logger
 
-
 logger = setup_logger()
-
 
 admin_router = APIRouter(prefix="/admin/settings")
 basic_router = APIRouter(prefix="/settings")

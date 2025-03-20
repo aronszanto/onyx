@@ -15,13 +15,14 @@ from tests.daily.connectors.google_drive.consts_and_utils import ADMIN_EMAIL
 from tests.daily.connectors.google_drive.consts_and_utils import ADMIN_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import ADMIN_FOLDER_3_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import file_name_template
+from tests.daily.connectors.google_drive.consts_and_utils import filter_invalid_prefixes
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_1_1_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_1_2_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_1_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_2_1_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_2_2_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import FOLDER_2_FILE_IDS
-from tests.daily.connectors.google_drive.consts_and_utils import print_discrepencies
+from tests.daily.connectors.google_drive.consts_and_utils import print_discrepancies
 from tests.daily.connectors.google_drive.consts_and_utils import PUBLIC_RANGE
 from tests.daily.connectors.google_drive.consts_and_utils import SECTIONS_FILE_IDS
 from tests.daily.connectors.google_drive.consts_and_utils import SHARED_DRIVE_1_FILE_IDS
@@ -81,9 +82,10 @@ def assert_correct_access_for_user(
     all_accessible_ids = expected_access_ids + PUBLIC_RANGE
     expected_file_names = {file_name_template.format(i) for i in all_accessible_ids}
 
-    print_discrepencies(expected_file_names, retrieved_file_names)
+    filtered_retrieved_file_names = filter_invalid_prefixes(retrieved_file_names)
+    print_discrepancies(expected_file_names, filtered_retrieved_file_names)
 
-    assert expected_file_names == retrieved_file_names
+    assert expected_file_names == filtered_retrieved_file_names
 
 
 # This function is supposed to map to the group_sync.py file for the google drive connector
@@ -172,8 +174,9 @@ def test_all_permissions(
     }
 
     # Should get everything
-    print_discrepencies(expected_file_names, found_file_names)
-    assert expected_file_names == found_file_names
+    filtered_retrieved_file_names = filter_invalid_prefixes(found_file_names)
+    print_discrepancies(expected_file_names, filtered_retrieved_file_names)
+    assert expected_file_names == filtered_retrieved_file_names
 
     group_map = get_group_map(google_drive_connector)
 

@@ -1,5 +1,6 @@
 from base64 import urlsafe_b64decode
 from typing import Any
+from typing import cast
 from typing import Dict
 
 from google.oauth2.credentials import Credentials as OAuthCredentials  # type: ignore
@@ -28,8 +29,10 @@ from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.interfaces import SlimConnector
 from onyx.connectors.models import BasicExpertInfo
 from onyx.connectors.models import Document
-from onyx.connectors.models import Section
+from onyx.connectors.models import ImageSection
 from onyx.connectors.models import SlimDocument
+from onyx.connectors.models import TextSection
+from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
 from onyx.utils.retry_wrapper import retry_builder
 
@@ -114,7 +117,7 @@ def _get_message_body(payload: dict[str, Any]) -> str:
     return message_body
 
 
-def message_to_section(message: Dict[str, Any]) -> tuple[Section, dict[str, str]]:
+def message_to_section(message: Dict[str, Any]) -> tuple[TextSection, dict[str, str]]:
     link = f"https://mail.google.com/mail/u/0/#inbox/{message['id']}"
 
     payload = message.get("payload", {})
@@ -141,7 +144,7 @@ def message_to_section(message: Dict[str, Any]) -> tuple[Section, dict[str, str]
 
     message_body_text: str = _get_message_body(payload)
 
-    return Section(link=link, text=message_body_text + message_data), metadata
+    return TextSection(link=link, text=message_body_text + message_data), metadata
 
 
 def thread_to_document(full_thread: Dict[str, Any]) -> Document | None:
@@ -191,7 +194,7 @@ def thread_to_document(full_thread: Dict[str, Any]) -> Document | None:
     return Document(
         id=id,
         semantic_identifier=semantic_identifier,
-        sections=sections,
+        sections=cast(list[TextSection | ImageSection], sections),
         source=DocumentSource.GMAIL,
         # This is used to perform permission sync
         primary_owners=primary_owners,
@@ -296,6 +299,7 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
                 userId=user_email,
                 fields=THREAD_LIST_FIELDS,
                 q=query,
+                continue_on_404_or_403=True,
             ):
                 full_threads = execute_paginated_retrieval(
                     retrieval_function=gmail_service.users().threads().get,
@@ -303,6 +307,7 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
                     userId=user_email,
                     fields=THREAD_FIELDS,
                     id=thread["id"],
+                    continue_on_404_or_403=True,
                 )
                 # full_threads is an iterator containing a single thread
                 # so we need to convert it to a list and grab the first element
@@ -321,6 +326,7 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
         self,
         time_range_start: SecondsSinceUnixEpoch | None = None,
         time_range_end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
         query = _build_time_range_query(time_range_start, time_range_end)
         doc_batch = []
@@ -333,6 +339,7 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
                 userId=user_email,
                 fields=THREAD_LIST_FIELDS,
                 q=query,
+                continue_on_404_or_403=True,
             ):
                 doc_batch.append(
                     SlimDocument(
@@ -343,6 +350,15 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
                 if len(doc_batch) > SLIM_BATCH_SIZE:
                     yield doc_batch
                     doc_batch = []
+
+                    if callback:
+                        if callback.should_stop():
+                            raise RuntimeError(
+                                "retrieve_all_slim_documents: Stop signal detected"
+                            )
+
+                        callback.progress("retrieve_all_slim_documents", 1)
+
         if doc_batch:
             yield doc_batch
 
@@ -368,9 +384,10 @@ class GmailConnector(LoadConnector, PollConnector, SlimConnector):
         self,
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
         try:
-            yield from self._fetch_slim_threads(start, end)
+            yield from self._fetch_slim_threads(start, end, callback=callback)
         except Exception as e:
             if MISSING_SCOPES_ERROR_STR in str(e):
                 raise PermissionError(ONYX_SCOPE_INSTRUCTIONS) from e

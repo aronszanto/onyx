@@ -18,7 +18,7 @@ import { GenericConfirmModal } from "@/components/modals/GenericConfirmModal";
 import { useState } from "react";
 import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
 
-export const UserRoleDropdown = ({
+const UserRoleDropdown = ({
   user,
   onSuccess,
   onError,
@@ -68,13 +68,13 @@ export const UserRoleDropdown = ({
         onValueChange={handleChange}
         disabled={isSettingRole}
       >
-        <SelectTrigger>
+        <SelectTrigger data-testid={`user-role-dropdown-trigger-${user.email}`}>
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
           {(Object.entries(USER_ROLE_LABELS) as [UserRole, string][]).map(
             ([role, label]) => {
-              // Dont want to ever show external permissioned users because it's scary
+              // Don't want to ever show external permissioned users because it's scary
               if (role === UserRole.EXT_PERM_USER) return null;
 
               // Only want to show limited users if paid enterprise features are enabled
@@ -92,7 +92,11 @@ export const UserRoleDropdown = ({
               return isNotVisibleRole && !isCurrentRole ? null : (
                 <SelectItem
                   key={role}
+                  onClick={() => {
+                    console.log("clicked");
+                  }}
                   value={role}
+                  data-testid={`user-role-dropdown-${role}`}
                   title={INVALID_ROLE_HOVER_TEXT[role] ?? ""}
                   data-tooltip-delay="0"
                 >
@@ -121,3 +125,5 @@ export const UserRoleDropdown = ({
     </>
   );
 };
+
+export default UserRoleDropdown;

@@ -1,10 +1,12 @@
+"use client";
 import { CombinedSettings } from "@/app/admin/settings/interfaces";
 import { UserProvider } from "../user/UserProvider";
-import { ProviderContextProvider } from "../chat_search/ProviderContext";
+import { ProviderContextProvider } from "../chat/ProviderContext";
 import { SettingsProvider } from "../settings/SettingsProvider";
 import { AssistantsProvider } from "./AssistantsContext";
 import { Persona } from "@/app/admin/assistants/interfaces";
 import { User } from "@/lib/types";
+import { ModalProvider } from "./ModalContext";
 
 interface AppProviderProps {
   children: React.ReactNode;
@@ -24,18 +26,18 @@ export const AppProvider = ({
   hasImageCompatibleModel,
 }: AppProviderProps) => {
   return (
-    <UserProvider user={user}>
-      <ProviderContextProvider>
-        <SettingsProvider settings={settings}>
+    <SettingsProvider settings={settings}>
+      <UserProvider settings={settings} user={user}>
+        <ProviderContextProvider>
           <AssistantsProvider
             initialAssistants={assistants}
             hasAnyConnectors={hasAnyConnectors}
             hasImageCompatibleModel={hasImageCompatibleModel}
           >
-            {children}
+            <ModalProvider user={user}>{children}</ModalProvider>
           </AssistantsProvider>
-        </SettingsProvider>
-      </ProviderContextProvider>
-    </UserProvider>
+        </ProviderContextProvider>
+      </UserProvider>
+    </SettingsProvider>
   );
 };

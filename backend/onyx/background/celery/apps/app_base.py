@@ -2,6 +2,7 @@ import logging
 import multiprocessing
 import time
 from typing import Any
+from typing import cast
 
 import sentry_sdk
 from celery import Task
@@ -20,10 +21,11 @@ from sqlalchemy.orm import Session
 from onyx.background.celery.apps.task_formatters import CeleryTaskColoredFormatter
 from onyx.background.celery.apps.task_formatters import CeleryTaskPlainFormatter
 from onyx.background.celery.celery_utils import celery_is_worker_primary
+from onyx.configs.constants import ONYX_CLOUD_CELERY_TASK_PREFIX
 from onyx.configs.constants import OnyxRedisLocks
 from onyx.db.engine import get_sqlalchemy_engine
-from onyx.document_index.vespa.shared_utils.utils import get_vespa_http_client
-from onyx.document_index.vespa_constants import VESPA_CONFIG_SERVER_URL
+from onyx.document_index.vespa.shared_utils.utils import wait_for_vespa_with_timeout
+from onyx.httpx.httpx_pool import HttpxPool
 from onyx.redis.redis_connector import RedisConnector
 from onyx.redis.redis_connector_credential_pair import RedisConnectorCredentialPair
 from onyx.redis.redis_connector_delete import RedisConnectorDelete
@@ -32,6 +34,7 @@ from onyx.redis.redis_connector_ext_group_sync import RedisConnectorExternalGrou
 from onyx.redis.redis_connector_prune import RedisConnectorPrune
 from onyx.redis.redis_document_set import RedisDocumentSet
 from onyx.redis.redis_pool import get_redis_client
+from onyx.redis.redis_pool import get_shared_redis_client
 from onyx.redis.redis_usergroup import RedisUserGroup
 from onyx.utils.logger import ColoredFormatter
 from onyx.utils.logger import PlainFormatter
@@ -57,13 +60,35 @@ else:
     logger.debug("Sentry DSN not provided, skipping Sentry initialization")
 
 
+class TenantAwareTask(Task):
+    """A custom base Task that sets tenant_id in a contextvar before running."""
+
+    abstract = True  # So Celery knows not to register this as a real task.
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Grab tenant_id from the kwargs, or fallback to default if missing.
+        tenant_id = kwargs.get("tenant_id", None) or POSTGRES_DEFAULT_SCHEMA
+
+        # Set the context var
+        CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
+
+        # Actually run the task now
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            # Clear or reset after the task runs
+            # so it does not leak into any subsequent tasks on the same worker process
+            CURRENT_TENANT_ID_CONTEXTVAR.set(None)
+
+
+@task_prerun.connect
 def on_task_prerun(
     sender: Any | None = None,
     task_id: str | None = None,
     task: Task | None = None,
     args: tuple[Any, ...] | None = None,
     kwargs: dict[str, Any] | None = None,
-    **kwds: Any,
+    **other_kwargs: Any,
 ) -> None:
     pass
 
@@ -100,12 +125,16 @@ def on_task_postrun(
     if not task_id:
         return
 
+    if task.name.startswith(ONYX_CLOUD_CELERY_TASK_PREFIX):
+        # this is a cloud / all tenant task ... no postrun is needed
+        return
+
     # Get tenant_id directly from kwargs- each celery task has a tenant_id kwarg
     if not kwargs:
         logger.error(f"Task {task.name} (ID: {task_id}) is missing kwargs")
-        tenant_id = None
+        tenant_id = POSTGRES_DEFAULT_SCHEMA
     else:
-        tenant_id = kwargs.get("tenant_id")
+        tenant_id = cast(str, kwargs.get("tenant_id", POSTGRES_DEFAULT_SCHEMA))
 
     task_logger.debug(
         f"Task {task.name} (ID: {task_id}) completed with state: {state} "
@@ -161,16 +190,42 @@ def on_task_postrun(
         return
 
 
-def on_celeryd_init(sender: Any = None, conf: Any = None, **kwargs: Any) -> None:
+def on_celeryd_init(sender: str, conf: Any = None, **kwargs: Any) -> None:
     """The first signal sent on celery worker startup"""
-    multiprocessing.set_start_method("spawn")  # fork is unsafe, set to spawn
+
+    # NOTE(rkuo): start method "fork" is unsafe and we really need it to be "spawn"
+    # But something is blocking set_start_method from working in the cloud unless
+    # force=True. so we use force=True as a fallback.
+
+    all_start_methods: list[str] = multiprocessing.get_all_start_methods()
+    logger.info(f"Multiprocessing all start methods: {all_start_methods}")
+
+    try:
+        multiprocessing.set_start_method("spawn")  # fork is unsafe, set to spawn
+    except Exception:
+        logger.info(
+            "Multiprocessing set_start_method exceptioned. Trying force=True..."
+        )
+        try:
+            multiprocessing.set_start_method(
+                "spawn", force=True
+            )  # fork is unsafe, set to spawn
+        except Exception:
+            logger.info(
+                "Multiprocessing set_start_method force=True exceptioned even with force=True."
+            )
+
+    logger.info(
+        f"Multiprocessing selected start method: {multiprocessing.get_start_method()}"
+    )
 
 
 def wait_for_redis(sender: Any, **kwargs: Any) -> None:
     """Waits for redis to become ready subject to a hardcoded timeout.
-    Will raise WorkerShutdown to kill the celery worker if the timeout is reached."""
+    Will raise WorkerShutdown to kill the celery worker if the timeout
+    is reached."""
 
-    r = get_redis_client(tenant_id=None)
+    r = get_shared_redis_client()
 
     WAIT_INTERVAL = 5
     WAIT_LIMIT = 60
@@ -250,58 +305,13 @@ def wait_for_db(sender: Any, **kwargs: Any) -> None:
     return
 
 
-def wait_for_vespa(sender: Any, **kwargs: Any) -> None:
-    """Waits for Vespa to become ready subject to a hardcoded timeout.
-    Will raise WorkerShutdown to kill the celery worker if the timeout is reached."""
-
-    WAIT_INTERVAL = 5
-    WAIT_LIMIT = 60
-
-    ready = False
-    time_start = time.monotonic()
-    logger.info("Vespa: Readiness probe starting.")
-    while True:
-        try:
-            client = get_vespa_http_client()
-            response = client.get(f"{VESPA_CONFIG_SERVER_URL}/state/v1/health")
-            response.raise_for_status()
-
-            response_dict = response.json()
-            if response_dict["status"]["code"] == "up":
-                ready = True
-                break
-        except Exception:
-            pass
-
-        time_elapsed = time.monotonic() - time_start
-        if time_elapsed > WAIT_LIMIT:
-            break
-
-        logger.info(
-            f"Vespa: Readiness probe ongoing. elapsed={time_elapsed:.1f} timeout={WAIT_LIMIT:.1f}"
-        )
-
-        time.sleep(WAIT_INTERVAL)
-
-    if not ready:
-        msg = (
-            f"Vespa: Readiness probe did not succeed within the timeout "
-            f"({WAIT_LIMIT} seconds). Exiting..."
-        )
-        logger.error(msg)
-        raise WorkerShutdown(msg)
-
-    logger.info("Vespa: Readiness probe succeeded. Continuing...")
-    return
-
-
 def on_secondary_worker_init(sender: Any, **kwargs: Any) -> None:
     logger.info("Running as a secondary celery worker.")
 
     # Set up variables for waiting on primary worker
     WAIT_INTERVAL = 5
     WAIT_LIMIT = 60
-    r = get_redis_client(tenant_id=None)
+    r = get_shared_redis_client()
     time_start = time.monotonic()
 
     logger.info("Waiting for primary worker to be ready...")
@@ -332,7 +342,13 @@ def on_worker_ready(sender: Any, **kwargs: Any) -> None:
 
 
 def on_worker_shutdown(sender: Any, **kwargs: Any) -> None:
+    HttpxPool.close_all()
+
     if not celery_is_worker_primary(sender):
+        return
+
+    if not hasattr(sender, "primary_worker_lock"):
+        # primary_worker_lock will not exist when MULTI_TENANT is True
         return
 
     if not sender.primary_worker_lock:
@@ -414,9 +430,19 @@ def on_setup_logging(
     task_logger.setLevel(loglevel)
     task_logger.propagate = False
 
-    # Hide celery task received and succeeded/failed messages
+    # hide celery task received spam
+    # e.g. "Task check_for_pruning[a1e96171-0ba8-4e00-887b-9fbf7442eab3] received"
     strategy.logger.setLevel(logging.WARNING)
+
+    # uncomment this to hide celery task succeeded/failed spam
+    # e.g. "Task check_for_pruning[a1e96171-0ba8-4e00-887b-9fbf7442eab3] succeeded in 0.03137450001668185s: None"
     trace.logger.setLevel(logging.WARNING)
+
+
+def set_task_finished_log_level(logLevel: int) -> None:
+    """call this to override the setLevel in on_setup_logging. We are interested
+    in the task timings in the cloud but it can be spammy for self hosted."""
+    trace.logger.setLevel(logLevel)
 
 
 class TenantContextFilter(logging.Filter):
@@ -437,24 +463,6 @@ class TenantContextFilter(logging.Filter):
         return True
 
 
-@task_prerun.connect
-def set_tenant_id(
-    sender: Any | None = None,
-    task_id: str | None = None,
-    task: Task | None = None,
-    args: tuple[Any, ...] | None = None,
-    kwargs: dict[str, Any] | None = None,
-    **other_kwargs: Any,
-) -> None:
-    """Signal handler to set tenant ID in context var before task starts."""
-    tenant_id = (
-        kwargs.get("tenant_id", POSTGRES_DEFAULT_SCHEMA)
-        if kwargs
-        else POSTGRES_DEFAULT_SCHEMA
-    )
-    CURRENT_TENANT_ID_CONTEXTVAR.set(tenant_id)
-
-
 @task_postrun.connect
 def reset_tenant_id(
     sender: Any | None = None,
@@ -466,3 +474,13 @@ def reset_tenant_id(
 ) -> None:
     """Signal handler to reset tenant ID in context var after task ends."""
     CURRENT_TENANT_ID_CONTEXTVAR.set(POSTGRES_DEFAULT_SCHEMA)
+
+
+def wait_for_vespa_or_shutdown(sender: Any, **kwargs: Any) -> None:
+    """Waits for Vespa to become ready subject to a timeout.
+    Raises WorkerShutdown if the timeout is reached."""
+
+    if not wait_for_vespa_with_timeout():
+        msg = "Vespa: Readiness probe did not succeed within the timeout. Exiting..."
+        logger.error(msg)
+        raise WorkerShutdown(msg)

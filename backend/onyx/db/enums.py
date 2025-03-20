@@ -24,12 +24,30 @@ class IndexingMode(str, PyEnum):
     REINDEX = "reindex"
 
 
-# these may differ in the future, which is why we're okay with this duplication
-class DeletionStatus(str, PyEnum):
-    NOT_STARTED = "not_started"
+class SyncType(str, PyEnum):
+    DOCUMENT_SET = "document_set"
+    USER_GROUP = "user_group"
+    CONNECTOR_DELETION = "connector_deletion"
+    PRUNING = "pruning"  # not really a sync, but close enough
+    EXTERNAL_PERMISSIONS = "external_permissions"
+    EXTERNAL_GROUP = "external_group"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class SyncStatus(str, PyEnum):
     IN_PROGRESS = "in_progress"
     SUCCESS = "success"
     FAILED = "failed"
+    CANCELED = "canceled"
+
+    def is_terminal(self) -> bool:
+        terminal_states = {
+            SyncStatus.SUCCESS,
+            SyncStatus.FAILED,
+        }
+        return self in terminal_states
 
 
 # Consistent with Celery task statuses
@@ -45,6 +63,9 @@ class IndexModelStatus(str, PyEnum):
     PRESENT = "PRESENT"
     FUTURE = "FUTURE"
 
+    def is_current(self) -> bool:
+        return self == IndexModelStatus.PRESENT
+
 
 class ChatSessionSharedStatus(str, PyEnum):
     PUBLIC = "public"
@@ -55,6 +76,7 @@ class ConnectorCredentialPairStatus(str, PyEnum):
     ACTIVE = "ACTIVE"
     PAUSED = "PAUSED"
     DELETING = "DELETING"
+    INVALID = "INVALID"
 
     def is_active(self) -> bool:
         return self == ConnectorCredentialPairStatus.ACTIVE
@@ -64,3 +86,11 @@ class AccessType(str, PyEnum):
     PUBLIC = "public"
     PRIVATE = "private"
     SYNC = "sync"
+
+
+class EmbeddingPrecision(str, PyEnum):
+    # matches vespa tensor type
+    # only support float / bfloat16 for now, since there's not a
+    # good reason to specify anything else
+    BFLOAT16 = "bfloat16"
+    FLOAT = "float"

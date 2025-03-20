@@ -14,8 +14,8 @@ class RedisObjectHelper(ABC):
     FENCE_PREFIX = PREFIX + "_fence"
     TASKSET_PREFIX = PREFIX + "_taskset"
 
-    def __init__(self, tenant_id: str | None, id: str):
-        self._tenant_id: str | None = tenant_id
+    def __init__(self, tenant_id: str, id: str):
+        self._tenant_id: str = tenant_id
         self._id: str = id
         self.redis = get_redis_client(tenant_id=tenant_id)
 
@@ -82,11 +82,12 @@ class RedisObjectHelper(ABC):
     @abstractmethod
     def generate_tasks(
         self,
+        max_tasks: int,
         celery_app: Celery,
         db_session: Session,
         redis_client: Redis,
         lock: RedisLock,
-        tenant_id: str | None,
+        tenant_id: str,
     ) -> tuple[int, int] | None:
         """First element should be the number of actual tasks generated, second should
         be the number of docs that were candidates to be synced for the cc pair.

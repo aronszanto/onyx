@@ -6,6 +6,7 @@ from typing import Any
 from onyx.access.models import DocumentAccess
 from onyx.context.search.models import IndexFilters
 from onyx.context.search.models import InferenceChunkUncleaned
+from onyx.db.enums import EmbeddingPrecision
 from onyx.indexing.models import DocMetadataAwareIndexChunk
 from shared_configs.model_server_models import Embedding
 
@@ -33,6 +34,38 @@ class VespaChunkRequest:
         if self.max_chunk_ind is not None:
             return (self.max_chunk_ind - (self.min_chunk_ind or 0)) + 1
         return None
+
+
+@dataclass
+class IndexBatchParams:
+    """
+    Information necessary for efficiently indexing a batch of documents
+    """
+
+    doc_id_to_previous_chunk_cnt: dict[str, int | None]
+    doc_id_to_new_chunk_cnt: dict[str, int]
+    tenant_id: str
+    large_chunks_enabled: bool
+
+
+@dataclass
+class MinimalDocumentIndexingInfo:
+    """
+    Minimal information necessary for indexing a document
+    """
+
+    doc_id: str
+    chunk_start_index: int
+
+
+@dataclass
+class EnrichedDocumentIndexingInfo(MinimalDocumentIndexingInfo):
+    """
+    Enriched information necessary for indexing a document, including version and chunk range.
+    """
+
+    old_version: bool
+    chunk_end_index: int
 
 
 @dataclass
@@ -68,6 +101,7 @@ class VespaDocumentFields:
     document_sets: set[str] | None = None
     boost: float | None = None
     hidden: bool | None = None
+    aggregated_chunk_boost_factor: float | None = None
 
 
 @dataclass
@@ -77,7 +111,7 @@ class UpdateRequest:
     Does not update any of the None fields
     """
 
-    document_ids: list[str]
+    minimal_document_indexing_info: list[MinimalDocumentIndexingInfo]
     # all other fields except these 4 will always be left alone by the update request
     access: DocumentAccess | None = None
     document_sets: set[str] | None = None
@@ -104,7 +138,7 @@ class Verifiable(abc.ABC):
         index_name: str,
         secondary_index_name: str | None,
         *args: Any,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.index_name = index_name
@@ -113,17 +147,21 @@ class Verifiable(abc.ABC):
     @abc.abstractmethod
     def ensure_indices_exist(
         self,
-        index_embedding_dim: int,
+        primary_embedding_dim: int,
+        primary_embedding_precision: EmbeddingPrecision,
         secondary_index_embedding_dim: int | None,
+        secondary_index_embedding_precision: EmbeddingPrecision | None,
     ) -> None:
         """
         Verify that the document index exists and is consistent with the expectations in the code.
 
         Parameters:
-        - index_embedding_dim: Vector dimensionality for the vector similarity part of the search
+        - primary_embedding_dim: Vector dimensionality for the vector similarity part of the search
+        - primary_embedding_precision: Precision of the vector similarity part of the search
         - secondary_index_embedding_dim: Vector dimensionality of the secondary index being built
                 behind the scenes. The secondary index should only be built when switching
                 embedding models therefore this dim should be different from the primary index.
+        - secondary_index_embedding_precision: Precision of the vector similarity part of the secondary index
         """
         raise NotImplementedError
 
@@ -132,6 +170,7 @@ class Verifiable(abc.ABC):
     def register_multitenant_indices(
         indices: list[str],
         embedding_dims: list[int],
+        embedding_precisions: list[EmbeddingPrecision],
     ) -> None:
         """
         Register multitenant indices with the document index.
@@ -148,7 +187,7 @@ class Indexable(abc.ABC):
     def index(
         self,
         chunks: list[DocMetadataAwareIndexChunk],
-        fresh_index: bool = False,
+        index_batch_params: IndexBatchParams,
     ) -> set[DocumentInsertionRecord]:
         """
         Takes a list of document chunks and indexes them in the document index
@@ -166,14 +205,11 @@ class Indexable(abc.ABC):
         only needs to index chunks into the PRIMARY index. Do not update the secondary index here,
         it is done automatically outside of this code.
 
-        NOTE: The fresh_index parameter, when set to True, assumes no documents have been previously
-        indexed for the given index/tenant. This can be used to optimize the indexing process for
-        new or empty indices.
-
         Parameters:
         - chunks: Document chunks with all of the information needed for indexing to the document
                 index.
-        - fresh_index: Boolean indicating whether this is a fresh index with no existing documents.
+        - tenant_id: The tenant id of the user whose chunks are being indexed
+        - large_chunks_enabled: Whether large chunks are enabled
 
         Returns:
             List of document ids which map to unique documents and are used for deduping chunks
@@ -185,26 +221,22 @@ class Indexable(abc.ABC):
 
 class Deletable(abc.ABC):
     """
-    Class must implement the ability to delete document by their unique document ids.
+    Class must implement the ability to delete document by a given unique document id.
     """
 
     @abc.abstractmethod
-    def delete_single(self, doc_id: str) -> int:
+    def delete_single(
+        self,
+        doc_id: str,
+        *,
+        tenant_id: str,
+        chunk_count: int | None,
+    ) -> int:
         """
         Given a single document id, hard delete it from the document index
 
         Parameters:
         - doc_id: document id as specified by the connector
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def delete(self, doc_ids: list[str]) -> None:
-        """
-        Given a list of document ids, hard delete them from the document index
-
-        Parameters:
-        - doc_ids: list of document ids as specified by the connector
         """
         raise NotImplementedError
 
@@ -220,7 +252,14 @@ class Updatable(abc.ABC):
     """
 
     @abc.abstractmethod
-    def update_single(self, doc_id: str, fields: VespaDocumentFields) -> int:
+    def update_single(
+        self,
+        doc_id: str,
+        *,
+        tenant_id: str,
+        chunk_count: int | None,
+        fields: VespaDocumentFields,
+    ) -> int:
         """
         Updates all chunks for a document with the specified fields.
         None values mean that the field does not need an update.
@@ -238,7 +277,7 @@ class Updatable(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def update(self, update_requests: list[UpdateRequest]) -> None:
+    def update(self, update_requests: list[UpdateRequest], *, tenant_id: str) -> None:
         """
         Updates some set of chunks. The document and fields to update are specified in the update
         requests. Each update request in the list applies its changes to a list of document ids.

@@ -1,6 +1,8 @@
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import as_completed
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from typing import Any
 
@@ -11,7 +13,9 @@ from requests import RequestException
 from requests import Response
 from retry import retry
 
+from onyx.configs.app_configs import INDEXING_EMBEDDING_MODEL_NUM_THREADS
 from onyx.configs.app_configs import LARGE_CHUNK_RATIO
+from onyx.configs.app_configs import SKIP_WARM_UP
 from onyx.configs.model_configs import BATCH_SIZE_ENCODE_CHUNKS
 from onyx.configs.model_configs import (
     BATCH_SIZE_ENCODE_CHUNKS_FOR_API_EMBEDDING_SERVICES,
@@ -25,6 +29,8 @@ from onyx.natural_language_processing.exceptions import (
 from onyx.natural_language_processing.utils import get_tokenizer
 from onyx.natural_language_processing.utils import tokenizer_trim_content
 from onyx.utils.logger import setup_logger
+from shared_configs.configs import INDEXING_MODEL_SERVER_HOST
+from shared_configs.configs import INDEXING_MODEL_SERVER_PORT
 from shared_configs.configs import MODEL_SERVER_HOST
 from shared_configs.configs import MODEL_SERVER_PORT
 from shared_configs.enums import EmbeddingProvider
@@ -32,9 +38,11 @@ from shared_configs.enums import EmbedTextType
 from shared_configs.enums import RerankerProvider
 from shared_configs.model_server_models import ConnectorClassificationRequest
 from shared_configs.model_server_models import ConnectorClassificationResponse
+from shared_configs.model_server_models import ContentClassificationPrediction
 from shared_configs.model_server_models import Embedding
 from shared_configs.model_server_models import EmbedRequest
 from shared_configs.model_server_models import EmbedResponse
+from shared_configs.model_server_models import InformationContentClassificationResponses
 from shared_configs.model_server_models import IntentRequest
 from shared_configs.model_server_models import IntentResponse
 from shared_configs.model_server_models import RerankRequest
@@ -85,6 +93,7 @@ class EmbeddingModel:
         callback: IndexingHeartbeatInterface | None = None,
         api_version: str | None = None,
         deployment_name: str | None = None,
+        reduced_dimension: int | None = None,
     ) -> None:
         self.api_key = api_key
         self.provider_type = provider_type
@@ -96,6 +105,7 @@ class EmbeddingModel:
         self.api_url = api_url
         self.api_version = api_version
         self.deployment_name = deployment_name
+        self.reduced_dimension = reduced_dimension
         self.tokenizer = get_tokenizer(
             model_name=model_name, provider_type=provider_type
         )
@@ -131,10 +141,15 @@ class EmbeddingModel:
                 tries=10, delay=10, exceptions=ModelServerRateLimitError
             )(final_make_request_func)
 
+        response: Response | None = None
+
         try:
             response = final_make_request_func()
             return EmbedResponse(**response.json())
         except requests.HTTPError as e:
+            if not response:
+                raise HTTPError("HTTP error occurred - response is None.") from e
+
             try:
                 error_detail = response.json().get("detail", str(e))
             except Exception:
@@ -149,6 +164,7 @@ class EmbeddingModel:
         text_type: EmbedTextType,
         batch_size: int,
         max_seq_length: int,
+        num_threads: int = INDEXING_EMBEDDING_MODEL_NUM_THREADS,
     ) -> list[Embedding]:
         text_batches = batch_list(texts, batch_size)
 
@@ -157,12 +173,14 @@ class EmbeddingModel:
         )
 
         embeddings: list[Embedding] = []
-        for idx, text_batch in enumerate(text_batches, start=1):
+
+        def process_batch(
+            batch_idx: int, text_batch: list[str]
+        ) -> tuple[int, list[Embedding]]:
             if self.callback:
                 if self.callback.should_stop():
                     raise RuntimeError("_batch_encode_texts detected stop signal")
 
-            logger.debug(f"Encoding batch {idx} of {len(text_batches)}")
             embed_request = EmbedRequest(
                 model_name=self.model_name,
                 texts=text_batch,
@@ -176,13 +194,55 @@ class EmbeddingModel:
                 manual_query_prefix=self.query_prefix,
                 manual_passage_prefix=self.passage_prefix,
                 api_url=self.api_url,
+                reduced_dimension=self.reduced_dimension,
             )
 
+            start_time = time.time()
             response = self._make_model_server_request(embed_request)
-            embeddings.extend(response.embeddings)
+            end_time = time.time()
 
-            if self.callback:
-                self.callback.progress("_batch_encode_texts", 1)
+            processing_time = end_time - start_time
+            logger.info(
+                f"Batch {batch_idx} processing time: {processing_time:.2f} seconds"
+            )
+
+            return batch_idx, response.embeddings
+
+        # only multi thread if:
+        #   1. num_threads is greater than 1
+        #   2. we are using an API-based embedding model (provider_type is not None)
+        #   3. there are more than 1 batch (no point in threading if only 1)
+        if num_threads >= 1 and self.provider_type and len(text_batches) > 1:
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                future_to_batch = {
+                    executor.submit(process_batch, idx, batch): idx
+                    for idx, batch in enumerate(text_batches, start=1)
+                }
+
+                # Collect results in order
+                batch_results: list[tuple[int, list[Embedding]]] = []
+                for future in as_completed(future_to_batch):
+                    try:
+                        result = future.result()
+                        batch_results.append(result)
+                        if self.callback:
+                            self.callback.progress("_batch_encode_texts", 1)
+                    except Exception as e:
+                        logger.exception("Embedding model failed to process batch")
+                        raise e
+
+                # Sort by batch index and extend embeddings
+                batch_results.sort(key=lambda x: x[0])
+                for _, batch_embeddings in batch_results:
+                    embeddings.extend(batch_embeddings)
+        else:
+            # Original sequential processing
+            for idx, text_batch in enumerate(text_batches, start=1):
+                _, batch_embeddings = process_batch(idx, text_batch)
+                embeddings.extend(batch_embeddings)
+                if self.callback:
+                    self.callback.progress("_batch_encode_texts", 1)
+
         return embeddings
 
     def encode(
@@ -247,6 +307,7 @@ class EmbeddingModel:
             retrim_content=retrim_content,
             api_version=search_settings.api_version,
             deployment_name=search_settings.deployment_name,
+            reduced_dimension=search_settings.reduced_dimension,
         )
 
 
@@ -320,6 +381,31 @@ class QueryAnalysisModel:
         return response_model.is_keyword, response_model.keywords
 
 
+class InformationContentClassificationModel:
+    def __init__(
+        self,
+        model_server_host: str = INDEXING_MODEL_SERVER_HOST,
+        model_server_port: int = INDEXING_MODEL_SERVER_PORT,
+    ) -> None:
+        model_server_url = build_model_server_url(model_server_host, model_server_port)
+        self.content_server_endpoint = (
+            model_server_url + "/custom/content-classification"
+        )
+
+    def predict(
+        self,
+        queries: list[str],
+    ) -> list[ContentClassificationPrediction]:
+        response = requests.post(self.content_server_endpoint, json=queries)
+        response.raise_for_status()
+
+        model_responses = InformationContentClassificationResponses(
+            information_content_classifications=response.json()
+        )
+
+        return model_responses.information_content_classifications
+
+
 class ConnectorClassificationModel:
     def __init__(
         self,
@@ -379,6 +465,9 @@ def warm_up_bi_encoder(
     embedding_model: EmbeddingModel,
     non_blocking: bool = False,
 ) -> None:
+    if SKIP_WARM_UP:
+        return
+
     warm_up_str = " ".join(WARM_UP_STRINGS)
 
     logger.debug(f"Warming up encoder model: {embedding_model.model_name}")

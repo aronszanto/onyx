@@ -60,17 +60,19 @@ export function extractCodeText(
   return codeText || "";
 }
 
-// This is a temporary solution to preprocess LaTeX in  LLM output
+// We must preprocess LaTeX in the LLM output to avoid improper formatting
 export const preprocessLaTeX = (content: string) => {
-  // Replace block-level LaTeX delimiters \[ \] with $$ $$
+  // 1) Replace block-level LaTeX delimiters \[ \] with $$ $$
   const blockProcessedContent = content.replace(
     /\\\[([\s\S]*?)\\\]/g,
     (_, equation) => `$$${equation}$$`
   );
-  // Replace inline LaTeX delimiters \( \) with $ $
+
+  // 2) Replace inline LaTeX delimiters \( \) with $ $
   const inlineProcessedContent = blockProcessedContent.replace(
     /\\\(([\s\S]*?)\\\)/g,
     (_, equation) => `$${equation}$`
   );
+
   return inlineProcessedContent;
 };

@@ -3,9 +3,14 @@ import os
 import urllib.parse
 from typing import cast
 
+from onyx.auth.schemas import AuthBackend
 from onyx.configs.constants import AuthType
 from onyx.configs.constants import DocumentIndexType
+from onyx.configs.constants import QueryHistoryType
 from onyx.file_processing.enums import HtmlBasedConnectorTransformLinksStrategy
+from onyx.prompts.image_analysis import DEFAULT_IMAGE_ANALYSIS_SYSTEM_PROMPT
+from onyx.prompts.image_analysis import DEFAULT_IMAGE_SUMMARIZATION_SYSTEM_PROMPT
+from onyx.prompts.image_analysis import DEFAULT_IMAGE_SUMMARIZATION_USER_PROMPT
 
 #####
 # App Configs
@@ -17,6 +22,7 @@ APP_PORT = 8080
 # prefix from requests directed towards the API server. In these cases, set this to `/api`
 APP_API_PREFIX = os.environ.get("API_PREFIX", "")
 
+SKIP_WARM_UP = os.environ.get("SKIP_WARM_UP", "").lower() == "true"
 
 #####
 # User Facing Features Configs
@@ -27,6 +33,13 @@ GENERATIVE_MODEL_ACCESS_CHECK_FREQ = int(
 )  # 1 day
 DISABLE_GENERATIVE_AI = os.environ.get("DISABLE_GENERATIVE_AI", "").lower() == "true"
 
+# Controls whether to allow admin query history reports with:
+# 1. associated user emails
+# 2. anonymized user emails
+# 3. no queries
+ONYX_QUERY_HISTORY_TYPE = QueryHistoryType(
+    (os.environ.get("ONYX_QUERY_HISTORY_TYPE") or QueryHistoryType.NORMAL.value).lower()
+)
 
 #####
 # Web Configs
@@ -54,9 +67,16 @@ MASK_CREDENTIAL_PREFIX = (
     os.environ.get("MASK_CREDENTIAL_PREFIX", "True").lower() != "false"
 )
 
+AUTH_BACKEND = AuthBackend(os.environ.get("AUTH_BACKEND") or AuthBackend.REDIS.value)
+
 SESSION_EXPIRE_TIME_SECONDS = int(
-    os.environ.get("SESSION_EXPIRE_TIME_SECONDS") or 86400 * 7
+    os.environ.get("SESSION_EXPIRE_TIME_SECONDS")
+    or os.environ.get("REDIS_AUTH_EXPIRE_TIME_SECONDS")
+    or 86400 * 7
 )  # 7 days
+
+# Default request timeout, mostly used by connectors
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS") or 60)
 
 # set `VALID_EMAIL_DOMAINS` to a comma seperated list of domains in order to
 # restrict access to Onyx to only users with emails from those domains.
@@ -83,6 +103,12 @@ OAUTH_CLIENT_SECRET = (
 )
 
 USER_AUTH_SECRET = os.environ.get("USER_AUTH_SECRET", "")
+
+# Duration (in seconds) for which the FastAPI Users JWT token remains valid in the user's browser.
+# By default, this is set to match the Redis expiry time for consistency.
+AUTH_COOKIE_EXPIRE_TIME_SECONDS = int(
+    os.environ.get("AUTH_COOKIE_EXPIRE_TIME_SECONDS") or 86400 * 7
+)  # 7 days
 
 # for basic auth
 REQUIRE_EMAIL_VERIFICATION = (
@@ -136,6 +162,8 @@ try:
 except ValueError:
     INDEX_BATCH_SIZE = 16
 
+MAX_DRIVE_WORKERS = int(os.environ.get("MAX_DRIVE_WORKERS", 4))
+
 # Below are intended to match the env variables names used by the official postgres docker image
 # https://hub.docker.com/_/postgres
 POSTGRES_USER = os.environ.get("POSTGRES_USER") or "postgres"
@@ -146,7 +174,7 @@ POSTGRES_PASSWORD = urllib.parse.quote_plus(
 POSTGRES_HOST = os.environ.get("POSTGRES_HOST") or "localhost"
 POSTGRES_PORT = os.environ.get("POSTGRES_PORT") or "5432"
 POSTGRES_DB = os.environ.get("POSTGRES_DB") or "postgres"
-AWS_REGION = os.environ.get("AWS_REGION") or "us-east-2"
+AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME") or "us-east-2"
 
 POSTGRES_API_SERVER_POOL_SIZE = int(
     os.environ.get("POSTGRES_API_SERVER_POOL_SIZE") or 40
@@ -154,6 +182,11 @@ POSTGRES_API_SERVER_POOL_SIZE = int(
 POSTGRES_API_SERVER_POOL_OVERFLOW = int(
     os.environ.get("POSTGRES_API_SERVER_POOL_OVERFLOW") or 10
 )
+
+# defaults to False
+# generally should only be used for
+POSTGRES_USE_NULL_POOL = os.environ.get("POSTGRES_USE_NULL_POOL", "").lower() == "true"
+
 # defaults to False
 POSTGRES_POOL_PRE_PING = os.environ.get("POSTGRES_POOL_PRE_PING", "").lower() == "true"
 
@@ -185,6 +218,29 @@ REDIS_HOST = os.environ.get("REDIS_HOST") or "localhost"
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or ""
 
+# this assumes that other redis settings remain the same as the primary
+REDIS_REPLICA_HOST = os.environ.get("REDIS_REPLICA_HOST") or REDIS_HOST
+
+REDIS_AUTH_KEY_PREFIX = "fastapi_users_token:"
+
+# Rate limiting for auth endpoints
+RATE_LIMIT_WINDOW_SECONDS: int | None = None
+_rate_limit_window_seconds_str = os.environ.get("RATE_LIMIT_WINDOW_SECONDS")
+if _rate_limit_window_seconds_str is not None:
+    try:
+        RATE_LIMIT_WINDOW_SECONDS = int(_rate_limit_window_seconds_str)
+    except ValueError:
+        pass
+
+RATE_LIMIT_MAX_REQUESTS: int | None = None
+_rate_limit_max_requests_str = os.environ.get("RATE_LIMIT_MAX_REQUESTS")
+if _rate_limit_max_requests_str is not None:
+    try:
+        RATE_LIMIT_MAX_REQUESTS = int(_rate_limit_max_requests_str)
+    except ValueError:
+        pass
+
+AUTH_RATE_LIMITING_ENABLED = RATE_LIMIT_MAX_REQUESTS and RATE_LIMIT_WINDOW_SECONDS
 # Used for general redis things
 REDIS_DB_NUMBER = int(os.environ.get("REDIS_DB_NUMBER", 0))
 
@@ -252,6 +308,11 @@ try:
 except ValueError:
     CELERY_WORKER_INDEXING_CONCURRENCY = CELERY_WORKER_INDEXING_CONCURRENCY_DEFAULT
 
+# The maximum number of tasks that can be queued up to sync to Vespa in a single pass
+VESPA_SYNC_MAX_TASKS = 1024
+
+DB_YIELD_PER_DEFAULT = 64
+
 #####
 # Connector Configs
 #####
@@ -286,8 +347,8 @@ HTML_BASED_CONNECTOR_TRANSFORM_LINKS_STRATEGY = os.environ.get(
     HtmlBasedConnectorTransformLinksStrategy.STRIP,
 )
 
-NOTION_CONNECTOR_ENABLE_RECURSIVE_PAGE_LOOKUP = (
-    os.environ.get("NOTION_CONNECTOR_ENABLE_RECURSIVE_PAGE_LOOKUP", "").lower()
+NOTION_CONNECTOR_DISABLE_RECURSIVE_PAGE_LOOKUP = (
+    os.environ.get("NOTION_CONNECTOR_DISABLE_RECURSIVE_PAGE_LOOKUP", "").lower()
     == "true"
 )
 
@@ -348,17 +409,30 @@ GITLAB_CONNECTOR_INCLUDE_CODE_FILES = (
     os.environ.get("GITLAB_CONNECTOR_INCLUDE_CODE_FILES", "").lower() == "true"
 )
 
+# Typically set to http://localhost:3000 for OAuth connector development
+CONNECTOR_LOCALHOST_OVERRIDE = os.getenv("CONNECTOR_LOCALHOST_OVERRIDE")
+
 # Egnyte specific configs
-EGNYTE_LOCALHOST_OVERRIDE = os.getenv("EGNYTE_LOCALHOST_OVERRIDE")
-EGNYTE_BASE_DOMAIN = os.getenv("EGNYTE_DOMAIN")
 EGNYTE_CLIENT_ID = os.getenv("EGNYTE_CLIENT_ID")
 EGNYTE_CLIENT_SECRET = os.getenv("EGNYTE_CLIENT_SECRET")
+
+# Linear specific configs
+LINEAR_CLIENT_ID = os.getenv("LINEAR_CLIENT_ID")
+LINEAR_CLIENT_SECRET = os.getenv("LINEAR_CLIENT_SECRET")
+
+# Slack specific configs
+SLACK_NUM_THREADS = int(os.getenv("SLACK_NUM_THREADS") or 2)
 
 DASK_JOB_CLIENT_ENABLED = (
     os.environ.get("DASK_JOB_CLIENT_ENABLED", "").lower() == "true"
 )
 EXPERIMENTAL_CHECKPOINTING_ENABLED = (
     os.environ.get("EXPERIMENTAL_CHECKPOINTING_ENABLED", "").lower() == "true"
+)
+
+LEAVE_CONNECTOR_ACTIVE_ON_INITIALIZATION_FAILURE = (
+    os.environ.get("LEAVE_CONNECTOR_ACTIVE_ON_INITIALIZATION_FAILURE", "").lower()
+    == "true"
 )
 
 PRUNING_DISABLED = -1
@@ -429,6 +503,12 @@ INDEXING_SIZE_WARNING_THRESHOLD = int(
 # during indexing, will log verbose memory diff stats every x batches and at the end.
 # 0 disables this behavior and is the default.
 INDEXING_TRACER_INTERVAL = int(os.environ.get("INDEXING_TRACER_INTERVAL") or 0)
+
+# Enable multi-threaded embedding model calls for parallel processing
+# Note: only applies for API-based embedding models
+INDEXING_EMBEDDING_MODEL_NUM_THREADS = int(
+    os.environ.get("INDEXING_EMBEDDING_MODEL_NUM_THREADS") or 1
+)
 
 # During an indexing attempt, specifies the number of batches which are allowed to
 # exception without aborting the attempt.
@@ -504,6 +584,9 @@ try:
 except json.JSONDecodeError:
     pass
 
+# LLM Model Update API endpoint
+LLM_MODEL_UPDATE_API_URL = os.environ.get("LLM_MODEL_UPDATE_API_URL")
+
 #####
 # Enterprise Edition Configs
 #####
@@ -543,7 +626,6 @@ CONTROL_PLANE_API_BASE_URL = os.environ.get(
 # JWT configuration
 JWT_ALGORITHM = "HS256"
 
-
 #####
 # API Key Configs
 #####
@@ -560,4 +642,37 @@ POD_NAMESPACE = os.environ.get("POD_NAMESPACE")
 
 DEV_MODE = os.environ.get("DEV_MODE", "").lower() == "true"
 
+INTEGRATION_TESTS_MODE = os.environ.get("INTEGRATION_TESTS_MODE", "").lower() == "true"
+
+MOCK_CONNECTOR_FILE_PATH = os.environ.get("MOCK_CONNECTOR_FILE_PATH")
+
 TEST_ENV = os.environ.get("TEST_ENV", "").lower() == "true"
+
+# Set to true to mock LLM responses for testing purposes
+MOCK_LLM_RESPONSE = (
+    os.environ.get("MOCK_LLM_RESPONSE") if os.environ.get("MOCK_LLM_RESPONSE") else None
+)
+
+
+DEFAULT_IMAGE_ANALYSIS_MAX_SIZE_MB = 20
+
+# Number of pre-provisioned tenants to maintain
+TARGET_AVAILABLE_TENANTS = int(os.environ.get("TARGET_AVAILABLE_TENANTS", "5"))
+
+
+# Image summarization configuration
+IMAGE_SUMMARIZATION_SYSTEM_PROMPT = os.environ.get(
+    "IMAGE_SUMMARIZATION_SYSTEM_PROMPT",
+    DEFAULT_IMAGE_SUMMARIZATION_SYSTEM_PROMPT,
+)
+
+# The user prompt for image summarization - the image filename will be automatically prepended
+IMAGE_SUMMARIZATION_USER_PROMPT = os.environ.get(
+    "IMAGE_SUMMARIZATION_USER_PROMPT",
+    DEFAULT_IMAGE_SUMMARIZATION_USER_PROMPT,
+)
+
+IMAGE_ANALYSIS_SYSTEM_PROMPT = os.environ.get(
+    "IMAGE_ANALYSIS_SYSTEM_PROMPT",
+    DEFAULT_IMAGE_ANALYSIS_SYSTEM_PROMPT,
+)

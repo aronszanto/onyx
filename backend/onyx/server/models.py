@@ -6,7 +6,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from onyx.auth.schemas import UserRole
-from onyx.auth.schemas import UserStatus
+from onyx.db.models import User
 
 
 DataT = TypeVar("DataT")
@@ -35,12 +35,23 @@ class FullUserSnapshot(BaseModel):
     id: UUID
     email: str
     role: UserRole
-    status: UserStatus
+    is_active: bool
+    password_configured: bool
 
-
-class InvitedUserSnapshot(BaseModel):
-    email: str
+    @classmethod
+    def from_user_model(cls, user: User) -> "FullUserSnapshot":
+        return cls(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            is_active=user.is_active,
+            password_configured=user.password_configured,
+        )
 
 
 class DisplayPriorityRequest(BaseModel):
     display_priority_map: dict[int, int]
+
+
+class InvitedUserSnapshot(BaseModel):
+    email: str

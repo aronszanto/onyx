@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from datetime import datetime
 from datetime import timezone
+from typing import cast
 from typing import List
 
 import requests
@@ -14,7 +15,8 @@ from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.models import BasicExpertInfo
 from onyx.connectors.models import ConnectorMissingCredentialError
 from onyx.connectors.models import Document
-from onyx.connectors.models import Section
+from onyx.connectors.models import ImageSection
+from onyx.connectors.models import TextSection
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -30,13 +32,14 @@ _FIREFLIES_API_QUERY = """
         transcripts(fromDate: $fromDate, toDate: $toDate, limit: $limit, skip: $skip) {
             id
             title
-            host_email
+            organizer_email
             participants
             date
             transcript_url
             sentences {
                 text
                 speaker_name
+                start_time
             }
         }
     }
@@ -44,16 +47,37 @@ _FIREFLIES_API_QUERY = """
 
 
 def _create_doc_from_transcript(transcript: dict) -> Document | None:
-    meeting_text = ""
-    sentences = transcript.get("sentences", [])
-    if sentences:
-        for sentence in sentences:
-            meeting_text += sentence.get("speaker_name") or "Unknown Speaker"
-            meeting_text += ": " + sentence.get("text", "") + "\n\n"
-    else:
+    sections: List[TextSection] = []
+    current_speaker_name = None
+    current_link = ""
+    current_text = ""
+
+    if transcript["sentences"] is None:
         return None
 
-    meeting_link = transcript["transcript_url"]
+    for sentence in transcript["sentences"]:
+        if sentence["speaker_name"] != current_speaker_name:
+            if current_speaker_name is not None:
+                sections.append(
+                    TextSection(
+                        link=current_link,
+                        text=current_text.strip(),
+                    )
+                )
+            current_speaker_name = sentence.get("speaker_name") or "Unknown Speaker"
+            current_link = f"{transcript['transcript_url']}?t={sentence['start_time']}"
+            current_text = f"{current_speaker_name}: "
+
+        cleaned_text = sentence["text"].replace("\xa0", " ")
+        current_text += f"{cleaned_text} "
+
+    # Sometimes these links (links with a timestamp) do not work, it is a bug with Fireflies.
+    sections.append(
+        TextSection(
+            link=current_link,
+            text=current_text.strip(),
+        )
+    )
 
     fireflies_id = _FIREFLIES_ID_PREFIX + transcript["id"]
 
@@ -62,27 +86,22 @@ def _create_doc_from_transcript(transcript: dict) -> Document | None:
     meeting_date_unix = transcript["date"]
     meeting_date = datetime.fromtimestamp(meeting_date_unix / 1000, tz=timezone.utc)
 
-    meeting_host_email = transcript["host_email"]
-    host_email_user_info = [BasicExpertInfo(email=meeting_host_email)]
+    meeting_organizer_email = transcript["organizer_email"]
+    organizer_email_user_info = [BasicExpertInfo(email=meeting_organizer_email)]
 
     meeting_participants_email_list = []
     for participant in transcript.get("participants", []):
-        if participant != meeting_host_email and participant:
+        if participant != meeting_organizer_email and participant:
             meeting_participants_email_list.append(BasicExpertInfo(email=participant))
 
     return Document(
         id=fireflies_id,
-        sections=[
-            Section(
-                link=meeting_link,
-                text=meeting_text,
-            )
-        ],
+        sections=cast(list[TextSection | ImageSection], sections),
         source=DocumentSource.FIREFLIES,
         semantic_identifier=meeting_title,
         metadata={},
         doc_updated_at=meeting_date,
-        primary_owners=host_email_user_info,
+        primary_owners=organizer_email_user_info,
         secondary_owners=meeting_participants_email_list,
     )
 
@@ -170,12 +189,12 @@ class FirefliesConnector(PollConnector, LoadConnector):
         return self._process_transcripts()
 
     def poll_source(
-        self, start_unixtime: SecondsSinceUnixEpoch, end_unixtime: SecondsSinceUnixEpoch
+        self, start: SecondsSinceUnixEpoch, end: SecondsSinceUnixEpoch
     ) -> GenerateDocumentsOutput:
-        start_datetime = datetime.fromtimestamp(
-            start_unixtime, tz=timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        end_datetime = datetime.fromtimestamp(end_unixtime, tz=timezone.utc).strftime(
+        start_datetime = datetime.fromtimestamp(start, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        end_datetime = datetime.fromtimestamp(end, tz=timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.000Z"
         )
 

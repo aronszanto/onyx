@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel
+from pydantic import model_validator
 
 from onyx.configs.constants import DocumentSource
 from onyx.configs.constants import INDEX_SEPARATOR
@@ -26,8 +27,25 @@ class ConnectorMissingCredentialError(PermissionError):
 
 
 class Section(BaseModel):
+    """Base section class with common attributes"""
+
+    link: str | None = None
+    text: str | None = None
+    image_file_name: str | None = None
+
+
+class TextSection(Section):
+    """Section containing text content"""
+
     text: str
-    link: str | None
+    link: str | None = None
+
+
+class ImageSection(Section):
+    """Section containing an image reference"""
+
+    image_file_name: str
+    link: str | None = None
 
 
 class BasicExpertInfo(BaseModel):
@@ -97,12 +115,15 @@ class DocumentBase(BaseModel):
     """Used for Onyx ingestion api, the ID is inferred before use if not provided"""
 
     id: str | None = None
-    sections: list[Section]
+    sections: list[TextSection | ImageSection]
     source: DocumentSource | None = None
     semantic_identifier: str  # displayed in the UI as the main identifier for the doc
     metadata: dict[str, str | list[str]]
+
     # UTC time
     doc_updated_at: datetime | None = None
+    chunk_count: int | None = None
+
     # Owner, creator, etc.
     primary_owners: list[BasicExpertInfo] | None = None
     # Assignee, space owner, etc.
@@ -144,7 +165,9 @@ class DocumentBase(BaseModel):
 
 
 class Document(DocumentBase):
-    id: str  # This must be unique or during indexing/reindexing, chunks will be overwritten
+    """Used for Onyx ingestion api, the ID is required"""
+
+    id: str
     source: DocumentSource
 
     def to_short_descriptor(self) -> str:
@@ -169,41 +192,83 @@ class Document(DocumentBase):
         )
 
 
+class IndexingDocument(Document):
+    """Document with processed sections for indexing"""
+
+    processed_sections: list[Section] = []
+
+    def get_total_char_length(self) -> int:
+        """Get the total character length of the document including processed sections"""
+        title_len = len(self.title or self.semantic_identifier)
+
+        # Use processed_sections if available, otherwise fall back to original sections
+        if self.processed_sections:
+            section_len = sum(
+                len(section.text) if section.text is not None else 0
+                for section in self.processed_sections
+            )
+        else:
+            section_len = sum(
+                len(section.text)
+                if isinstance(section, TextSection) and section.text is not None
+                else 0
+                for section in self.sections
+            )
+
+        return title_len + section_len
+
+
 class SlimDocument(BaseModel):
     id: str
     perm_sync_data: Any | None = None
 
 
-class DocumentErrorSummary(BaseModel):
-    id: str
-    semantic_id: str
-    section_link: str | None
-
-    @classmethod
-    def from_document(cls, doc: Document) -> "DocumentErrorSummary":
-        section_link = doc.sections[0].link if len(doc.sections) > 0 else None
-        return cls(
-            id=doc.id, semantic_id=doc.semantic_identifier, section_link=section_link
-        )
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "DocumentErrorSummary":
-        return cls(
-            id=str(data.get("id")),
-            semantic_id=str(data.get("semantic_id")),
-            section_link=str(data.get("section_link")),
-        )
-
-    def to_dict(self) -> dict[str, str | None]:
-        return {
-            "id": self.id,
-            "semantic_id": self.semantic_id,
-            "section_link": self.section_link,
-        }
-
-
 class IndexAttemptMetadata(BaseModel):
     batch_num: int | None = None
-    num_exceptions: int = 0
     connector_id: int
     credential_id: int
+
+
+class ConnectorCheckpoint(BaseModel):
+    # TODO: maybe move this to something disk-based to handle extremely large checkpoints?
+    has_more: bool
+
+    def __str__(self) -> str:
+        """String representation of the checkpoint, with truncation for large checkpoint content."""
+        MAX_CHECKPOINT_CONTENT_CHARS = 1000
+
+        content_str = self.model_dump_json()
+        if len(content_str) > MAX_CHECKPOINT_CONTENT_CHARS:
+            content_str = content_str[: MAX_CHECKPOINT_CONTENT_CHARS - 3] + "..."
+        return content_str
+
+
+class DocumentFailure(BaseModel):
+    document_id: str
+    document_link: str | None = None
+
+
+class EntityFailure(BaseModel):
+    entity_id: str
+    missed_time_range: tuple[datetime, datetime] | None = None
+
+
+class ConnectorFailure(BaseModel):
+    failed_document: DocumentFailure | None = None
+    failed_entity: EntityFailure | None = None
+    failure_message: str
+    exception: Exception | None = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @model_validator(mode="before")
+    def check_failed_fields(cls, values: dict) -> dict:
+        failed_document = values.get("failed_document")
+        failed_entity = values.get("failed_entity")
+        if (failed_document is None and failed_entity is None) or (
+            failed_document is not None and failed_entity is not None
+        ):
+            raise ValueError(
+                "Exactly one of 'failed_document' or 'failed_entity' must be specified."
+            )
+        return values

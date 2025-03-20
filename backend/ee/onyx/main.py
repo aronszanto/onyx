@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 from httpx_oauth.clients.google import GoogleOAuth2
+from httpx_oauth.clients.openid import BASE_SCOPES
 from httpx_oauth.clients.openid import OpenID
 
+from ee.onyx.configs.app_configs import OIDC_SCOPE_OVERRIDE
 from ee.onyx.configs.app_configs import OPENID_CONFIG_URL
 from ee.onyx.server.analytics.api import router as analytics_router
 from ee.onyx.server.auth_check import check_ee_router_auth
@@ -13,7 +15,7 @@ from ee.onyx.server.enterprise_settings.api import (
 )
 from ee.onyx.server.manage.standard_answer import router as standard_answer_router
 from ee.onyx.server.middleware.tenant_tracking import add_tenant_id_middleware
-from ee.onyx.server.oauth import router as oauth_router
+from ee.onyx.server.oauth.api import router as ee_oauth_router
 from ee.onyx.server.query_and_chat.chat_backend import (
     router as chat_router,
 )
@@ -40,6 +42,7 @@ from onyx.configs.app_configs import USER_AUTH_SECRET
 from onyx.configs.app_configs import WEB_DOMAIN
 from onyx.configs.constants import AuthType
 from onyx.main import get_application as get_application_base
+from onyx.main import include_auth_router_with_prefix
 from onyx.main import include_router_with_global_prefix_prepended
 from onyx.utils.logger import setup_logger
 from onyx.utils.variable_functionality import global_version
@@ -62,7 +65,7 @@ def get_application() -> FastAPI:
 
     if AUTH_TYPE == AuthType.CLOUD:
         oauth_client = GoogleOAuth2(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET)
-        include_router_with_global_prefix_prepended(
+        include_auth_router_with_prefix(
             application,
             create_onyx_oauth_router(
                 oauth_client,
@@ -74,22 +77,26 @@ def get_application() -> FastAPI:
                 redirect_url=f"{WEB_DOMAIN}/auth/oauth/callback",
             ),
             prefix="/auth/oauth",
-            tags=["auth"],
         )
 
         # Need basic auth router for `logout` endpoint
-        include_router_with_global_prefix_prepended(
+        include_auth_router_with_prefix(
             application,
             fastapi_users.get_logout_router(auth_backend),
             prefix="/auth",
-            tags=["auth"],
         )
 
     if AUTH_TYPE == AuthType.OIDC:
-        include_router_with_global_prefix_prepended(
+        include_auth_router_with_prefix(
             application,
             create_onyx_oauth_router(
-                OpenID(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OPENID_CONFIG_URL),
+                OpenID(
+                    OAUTH_CLIENT_ID,
+                    OAUTH_CLIENT_SECRET,
+                    OPENID_CONFIG_URL,
+                    # BASE_SCOPES is the same as not setting this
+                    base_scopes=OIDC_SCOPE_OVERRIDE or BASE_SCOPES,
+                ),
                 auth_backend,
                 USER_AUTH_SECRET,
                 associate_by_email=True,
@@ -97,19 +104,20 @@ def get_application() -> FastAPI:
                 redirect_url=f"{WEB_DOMAIN}/auth/oidc/callback",
             ),
             prefix="/auth/oidc",
-            tags=["auth"],
         )
 
         # need basic auth router for `logout` endpoint
-        include_router_with_global_prefix_prepended(
+        include_auth_router_with_prefix(
             application,
             fastapi_users.get_auth_router(auth_backend),
             prefix="/auth",
-            tags=["auth"],
         )
 
     elif AUTH_TYPE == AuthType.SAML:
-        include_router_with_global_prefix_prepended(application, saml_router)
+        include_auth_router_with_prefix(
+            application,
+            saml_router,
+        )
 
     # RBAC / group access control
     include_router_with_global_prefix_prepended(application, user_group_router)
@@ -120,7 +128,7 @@ def get_application() -> FastAPI:
     include_router_with_global_prefix_prepended(application, query_router)
     include_router_with_global_prefix_prepended(application, chat_router)
     include_router_with_global_prefix_prepended(application, standard_answer_router)
-    include_router_with_global_prefix_prepended(application, oauth_router)
+    include_router_with_global_prefix_prepended(application, ee_oauth_router)
 
     # Enterprise-only global settings
     include_router_with_global_prefix_prepended(
@@ -143,5 +151,9 @@ def get_application() -> FastAPI:
     # seed the Onyx environment with LLMs, Assistants, etc. based on an optional
     # environment variable. Used to automate deployment for multiple environments.
     seed_db()
+
+    # for debugging discovered routes
+    # for route in application.router.routes:
+    #     print(f"Path: {route.path}, Methods: {route.methods}")
 
     return application

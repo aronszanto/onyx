@@ -13,9 +13,11 @@ from sentry_sdk.integrations.starlette import StarletteIntegration
 from transformers import logging as transformer_logging  # type:ignore
 
 from model_server.custom_models import router as custom_models_router
+from model_server.custom_models import warm_up_information_content_model
 from model_server.custom_models import warm_up_intent_model
 from model_server.encoders import router as encoders_router
 from model_server.management_endpoints import router as management_router
+from model_server.utils import get_gpu_type
 from onyx import __version__
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import INDEXING_ONLY
@@ -44,6 +46,7 @@ def _move_files_recursively(source: Path, dest: Path, overwrite: bool = False) -
     the files in the existing huggingface cache that don't exist in the temp
     huggingface cache.
     """
+
     for item in source.iterdir():
         target_path = dest / item.relative_to(source)
         if item.is_dir():
@@ -57,12 +60,10 @@ def _move_files_recursively(source: Path, dest: Path, overwrite: bool = False) -
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    if torch.cuda.is_available():
-        logger.notice("CUDA GPU is available")
-    elif torch.backends.mps.is_available():
-        logger.notice("Mac MPS is available")
-    else:
-        logger.notice("GPU is not available, using CPU")
+    gpu_type = get_gpu_type()
+    logger.notice(f"Torch GPU Detection: gpu_type={gpu_type}")
+
+    app.state.gpu_type = gpu_type
 
     if TEMP_HF_CACHE_PATH.is_dir():
         logger.notice("Moving contents of temp_huggingface to huggingface cache.")
@@ -74,9 +75,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     logger.notice(f"Torch Threads: {torch.get_num_threads()}")
 
     if not INDEXING_ONLY:
+        logger.notice(
+            "The intent model should run on the model server. The information content model should not run here."
+        )
         warm_up_intent_model()
     else:
-        logger.notice("This model server should only run document indexing.")
+        logger.notice(
+            "The content information model should run on the indexing model server. The intent model should not run here."
+        )
+        warm_up_information_content_model()
 
     yield
 

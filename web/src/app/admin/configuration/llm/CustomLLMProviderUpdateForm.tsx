@@ -21,7 +21,7 @@ import {
 } from "@/components/admin/connectors/Field";
 import { useState } from "react";
 import { useSWRConfig } from "swr";
-import { FullLLMProvider } from "./interfaces";
+import { LLMProviderView } from "./interfaces";
 import { PopupSpec } from "@/components/admin/connectors/Popup";
 import * as Yup from "yup";
 import isEqual from "lodash/isEqual";
@@ -43,7 +43,7 @@ export function CustomLLMProviderUpdateForm({
   hideSuccess,
 }: {
   onClose: () => void;
-  existingLlmProvider?: FullLLMProvider;
+  existingLlmProvider?: LLMProviderView;
   shouldMarkAsDefault?: boolean;
   setPopup?: (popup: PopupSpec) => void;
   hideSuccess?: boolean;
@@ -165,7 +165,7 @@ export function CustomLLMProviderUpdateForm({
         }
 
         if (shouldMarkAsDefault) {
-          const newLlmProvider = (await response.json()) as FullLLMProvider;
+          const newLlmProvider = (await response.json()) as LLMProviderView;
           const setDefaultResponse = await fetch(
             `${LLM_PROVIDERS_ADMIN_URL}/${newLlmProvider.id}/default`,
             {
@@ -348,7 +348,7 @@ export function CustomLLMProviderUpdateForm({
                           </div>
                           <div className="my-auto">
                             <FiX
-                              className="my-auto w-10 h-10 cursor-pointer hover:bg-hover rounded p-2"
+                              className="my-auto w-10 h-10 cursor-pointer hover:bg-accent-background-hovered rounded p-2"
                               onClick={() => arrayHelpers.remove(index)}
                             />
                           </div>

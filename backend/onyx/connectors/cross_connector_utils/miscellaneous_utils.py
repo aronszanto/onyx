@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable
 from collections.abc import Iterator
 from datetime import datetime
@@ -6,6 +7,7 @@ from typing import TypeVar
 
 from dateutil.parser import parse
 
+from onyx.configs.app_configs import CONNECTOR_LOCALHOST_OVERRIDE
 from onyx.configs.constants import IGNORE_FOR_QA
 from onyx.connectors.models import BasicExpertInfo
 from onyx.utils.text_processing import is_valid_email
@@ -23,16 +25,22 @@ def datetime_to_utc(dt: datetime) -> datetime:
 
 
 def time_str_to_utc(datetime_str: str) -> datetime:
+    # Remove all timezone abbreviations in parentheses
+    datetime_str = re.sub(r"\([A-Z]+\)", "", datetime_str).strip()
+
+    # Remove any remaining parentheses and their contents
+    datetime_str = re.sub(r"\(.*?\)", "", datetime_str).strip()
+
     try:
         dt = parse(datetime_str)
     except ValueError:
-        # Handle malformed timezone by attempting to fix common format issues
+        # Fix common format issues (e.g. "0000" => "+0000")
         if "0000" in datetime_str:
-            # Convert "0000" to "+0000" for proper timezone parsing
-            fixed_dt_str = datetime_str.replace(" 0000", " +0000")
-            dt = parse(fixed_dt_str)
+            datetime_str = datetime_str.replace(" 0000", " +0000")
+            dt = parse(datetime_str)
         else:
             raise
+
     return datetime_to_utc(dt)
 
 
@@ -71,3 +79,10 @@ def process_in_batches(
 
 def get_metadata_keys_to_ignore() -> list[str]:
     return [IGNORE_FOR_QA]
+
+
+def get_oauth_callback_uri(base_domain: str, connector_id: str) -> str:
+    if CONNECTOR_LOCALHOST_OVERRIDE:
+        # Used for development
+        base_domain = CONNECTOR_LOCALHOST_OVERRIDE
+    return f"{base_domain.strip('/')}/connector/oauth/callback/{connector_id}"

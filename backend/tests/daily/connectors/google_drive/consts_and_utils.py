@@ -1,6 +1,10 @@
+import time
 from collections.abc import Sequence
 
+from onyx.connectors.google_drive.connector import GoogleDriveConnector
 from onyx.connectors.models import Document
+from onyx.connectors.models import TextSection
+from tests.daily.connectors.utils import load_all_docs_from_checkpoint_connector
 
 ALL_FILES = list(range(0, 60))
 SHARED_DRIVE_FILES = list(range(20, 25))
@@ -20,6 +24,7 @@ FOLDER_2_FILE_IDS = list(range(45, 50))
 FOLDER_2_1_FILE_IDS = list(range(50, 55))
 FOLDER_2_2_FILE_IDS = list(range(55, 60))
 SECTIONS_FILE_IDS = [61]
+FOLDER_3_FILE_IDS = list(range(62, 65))
 
 PUBLIC_FOLDER_RANGE = FOLDER_1_2_FILE_IDS
 PUBLIC_FILE_IDS = list(range(55, 57))
@@ -52,6 +57,8 @@ FOLDER_3_URL = (
 SECTIONS_FOLDER_URL = (
     "https://drive.google.com/drive/u/5/folders/1loe6XJ-pJxu9YYPv7cF3Hmz296VNzA33"
 )
+
+SHARED_DRIVE_3_URL = "https://drive.google.com/drive/folders/0AJYm2K_I_vtNUk9PVA"
 
 ADMIN_EMAIL = "admin@onyx-test.com"
 TEST_USER_1_EMAIL = "test_user_1@onyx-test.com"
@@ -123,18 +130,31 @@ SPECIAL_FILE_ID_TO_CONTENT_MAP: dict[int, str] = {
 file_name_template = "file_{}.txt"
 file_text_template = "This is file {}"
 
+# This is done to prevent different tests from interfering with each other
+# So each test type should have its own valid prefix
+_VALID_PREFIX = "file_"
 
-def print_discrepencies(expected: set[str], retrieved: set[str]) -> None:
+
+def filter_invalid_prefixes(names: set[str]) -> set[str]:
+    return {name for name in names if name.startswith(_VALID_PREFIX)}
+
+
+def print_discrepancies(
+    expected: set[str],
+    retrieved: set[str],
+) -> None:
     if expected != retrieved:
-        print(expected)
-        print(retrieved)
+        expected_list = sorted(expected)
+        retrieved_list = sorted(retrieved)
+        print(expected_list)
+        print(retrieved_list)
         print("Extra:")
-        print(retrieved - expected)
+        print(sorted(retrieved - expected))
         print("Missing:")
-        print(expected - retrieved)
+        print(sorted(expected - retrieved))
 
 
-def get_file_content(file_id: int) -> str:
+def _get_expected_file_content(file_id: int) -> str:
     if file_id in SPECIAL_FILE_ID_TO_CONTENT_MAP:
         return SPECIAL_FILE_ID_TO_CONTENT_MAP[file_id]
 
@@ -142,25 +162,61 @@ def get_file_content(file_id: int) -> str:
 
 
 def assert_retrieved_docs_match_expected(
-    retrieved_docs: list[Document], expected_file_ids: Sequence[int]
+    retrieved_docs: list[Document],
+    expected_file_ids: Sequence[int],
 ) -> None:
     expected_file_names = {
         file_name_template.format(file_id) for file_id in expected_file_ids
     }
-    expected_file_texts = {get_file_content(file_id) for file_id in expected_file_ids}
+    expected_file_texts = {
+        _get_expected_file_content(file_id) for file_id in expected_file_ids
+    }
 
-    retrieved_file_names = set([doc.semantic_identifier for doc in retrieved_docs])
-    retrieved_texts = set(
+    retrieved_docs.sort(key=lambda x: x.semantic_identifier)
+
+    for doc in retrieved_docs:
+        print(f"doc.semantic_identifier: {doc.semantic_identifier}")
+
+    # Filter out invalid prefixes to prevent different tests from interfering with each other
+    valid_retrieved_docs = [
+        doc
+        for doc in retrieved_docs
+        if doc.semantic_identifier.startswith(_VALID_PREFIX)
+    ]
+    valid_retrieved_file_names = set(
+        [doc.semantic_identifier for doc in valid_retrieved_docs]
+    )
+    valid_retrieved_texts = set(
         [
-            " - ".join([section.text for section in doc.sections])
-            for doc in retrieved_docs
+            " - ".join(
+                [
+                    section.text
+                    for section in doc.sections
+                    if isinstance(section, TextSection) and section.text is not None
+                ]
+            )
+            for doc in valid_retrieved_docs
         ]
     )
 
     # Check file names
-    print_discrepencies(expected_file_names, retrieved_file_names)
-    assert expected_file_names == retrieved_file_names
+    print_discrepancies(
+        expected=expected_file_names,
+        retrieved=valid_retrieved_file_names,
+    )
+    assert expected_file_names == valid_retrieved_file_names
 
     # Check file texts
-    print_discrepencies(expected_file_texts, retrieved_texts)
-    assert expected_file_texts == retrieved_texts
+    print_discrepancies(
+        expected=expected_file_texts,
+        retrieved=valid_retrieved_texts,
+    )
+    assert expected_file_texts == valid_retrieved_texts
+
+
+def load_all_docs(connector: GoogleDriveConnector) -> list[Document]:
+    return load_all_docs_from_checkpoint_connector(
+        connector,
+        0,
+        time.time(),
+    )

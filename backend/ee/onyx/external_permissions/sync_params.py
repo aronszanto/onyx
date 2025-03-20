@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from collections.abc import Generator
 
 from ee.onyx.configs.app_configs import CONFLUENCE_PERMISSION_DOC_SYNC_FREQUENCY
 from ee.onyx.configs.app_configs import CONFLUENCE_PERMISSION_GROUP_SYNC_FREQUENCY
@@ -8,21 +9,27 @@ from ee.onyx.external_permissions.confluence.group_sync import confluence_group_
 from ee.onyx.external_permissions.gmail.doc_sync import gmail_doc_sync
 from ee.onyx.external_permissions.google_drive.doc_sync import gdrive_doc_sync
 from ee.onyx.external_permissions.google_drive.group_sync import gdrive_group_sync
+from ee.onyx.external_permissions.post_query_censoring import (
+    DOC_SOURCE_TO_CHUNK_CENSORING_FUNCTION,
+)
 from ee.onyx.external_permissions.slack.doc_sync import slack_doc_sync
 from onyx.access.models import DocExternalAccess
 from onyx.configs.constants import DocumentSource
 from onyx.db.models import ConnectorCredentialPair
+from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 
 # Defining the input/output types for the sync functions
 DocSyncFuncType = Callable[
     [
         ConnectorCredentialPair,
+        IndexingHeartbeatInterface | None,
     ],
-    list[DocExternalAccess],
+    Generator[DocExternalAccess, None, None],
 ]
 
 GroupSyncFuncType = Callable[
     [
+        str,
         ConnectorCredentialPair,
     ],
     list[ExternalUserGroup],
@@ -71,4 +78,7 @@ EXTERNAL_GROUP_SYNC_PERIODS: dict[DocumentSource, int] = {
 
 
 def check_if_valid_sync_source(source_type: DocumentSource) -> bool:
-    return source_type in DOC_PERMISSIONS_FUNC_MAP
+    return (
+        source_type in DOC_PERMISSIONS_FUNC_MAP
+        or source_type in DOC_SOURCE_TO_CHUNK_CENSORING_FUNCTION
+    )
