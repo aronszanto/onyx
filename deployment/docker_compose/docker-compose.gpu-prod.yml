@@ -118,6 +118,8 @@ services:
     build:
       context: ../../backend
       dockerfile: Dockerfile.model_server
+    # for GPU support, please read installation guidelines in the README.md
+    # bare minimum to get this working is to install nvidia-container-toolkit
     deploy:
       resources:
         reservations:
@@ -134,8 +136,10 @@ services:
       fi"
     restart: on-failure
     environment:
+      - INDEX_BATCH_SIZE=${INDEX_BATCH_SIZE:-}
       - MIN_THREADS_ML_MODELS=${MIN_THREADS_ML_MODELS:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      - CLIENT_EMBEDDING_TIMEOUT=${CLIENT_EMBEDDING_TIMEOUT:-}
     volumes:
       - model_cache_huggingface:/root/.cache/huggingface/
       - inference_model_server_logs:/var/log
@@ -152,6 +156,8 @@ services:
     build:
       context: ../../backend
       dockerfile: Dockerfile.model_server
+    # for GPU support, please read installation guidelines in the README.md
+    # bare minimum to get this working is to install nvidia-container-toolkit
     deploy:
       resources:
         reservations:
@@ -185,6 +191,7 @@ services:
 
   relational_db:
     image: postgres:15.2-alpine
+    shm_size: 1g
     command: -c 'max_connections=250'
     restart: always
     env_file:
@@ -201,8 +208,10 @@ services:
 
   # This container name cannot have an underscore in it due to Vespa expectations of the URL
   index:
-    image: vespaengine/vespa:8.277.17
+    image: vespaengine/vespa:8.526.15
     restart: always
+    environment:
+      - VESPA_SKIP_UPGRADE_CHECK=true
     ports:
       - "19071:19071"
       - "8081:8081"
