@@ -13,8 +13,9 @@ services:
       - relational_db
       - index
       - cache
+      - minio
       - inference_model_server
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -24,16 +25,20 @@ services:
       - REDIS_HOST=cache
       - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
       - USE_IAM_AUTH=${USE_IAM_AUTH}
-      - AWS_REGION=${AWS_REGION-}
+      - AWS_REGION_NAME=${AWS_REGION_NAME-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY-}
+      # MinIO configuration
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
       driver: awslogs
       options:
         awslogs-region: us-east-1
-        awslogs-group: onyx-dev
+        awslogs-group: riq-prod
         awslogs-stream: api_server
         awslogs-create-group: "true"
     volumes:
@@ -54,9 +59,10 @@ services:
       - relational_db
       - index
       - cache
+      - minio
       - inference_model_server
       - indexing_model_server
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -67,9 +73,13 @@ services:
       - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
       - INDEXING_MODEL_SERVER_HOST=${INDEXING_MODEL_SERVER_HOST:-indexing_model_server}
       - USE_IAM_AUTH=${USE_IAM_AUTH}
-      - AWS_REGION=${AWS_REGION-}
+      - AWS_REGION_NAME=${AWS_REGION_NAME-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY-}
+      # MinIO configuration
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -100,7 +110,7 @@ services:
         - NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED=${NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED:-}
     depends_on:
       - api_server
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -141,7 +151,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - CLIENT_EMBEDDING_TIMEOUT=${CLIENT_EMBEDDING_TIMEOUT:-}
     volumes:
-      - model_cache_huggingface:/root/.cache/huggingface/
+      - model_cache_huggingface:/app/.cache/huggingface/
       - inference_model_server_logs:/var/log
     logging:
       driver: awslogs
@@ -179,7 +189,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - VESPA_SEARCHER_THREADS=${VESPA_SEARCHER_THREADS:-1}
     volumes:
-      - indexing_huggingface_model_cache:/root/.cache/huggingface/
+      - indexing_huggingface_model_cache:/app/.cache/huggingface/
       - indexing_model_server_logs:/var/log
     logging:
       driver: awslogs
@@ -193,7 +203,7 @@ services:
     image: postgres:15.2-alpine
     shm_size: 1g
     command: -c 'max_connections=250'
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     volumes:
@@ -209,7 +219,7 @@ services:
   # This container name cannot have an underscore in it due to Vespa expectations of the URL
   index:
     image: vespaengine/vespa:8.526.15
-    restart: always
+    restart: unless-stopped
     environment:
       - VESPA_SKIP_UPGRADE_CHECK=true
     ports:
@@ -227,7 +237,7 @@ services:
 
   nginx:
     image: nginx:1.23.4-alpine
-    restart: always
+    restart: unless-stopped
     depends_on:
       - api_server
       - web_server
@@ -253,7 +263,7 @@ services:
 
   certbot:
     image: certbot/certbot
-    restart: always
+    restart: unless-stopped
     volumes:
       - ../data/certbot/conf:/etc/letsencrypt
       - ../data/certbot/www:/var/www/certbot
@@ -266,9 +276,32 @@ services:
         awslogs-create-group: "true"
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
 
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_DEFAULT_BUCKETS: ${S3_FILE_STORE_BUCKET_NAME:-onyx-file-store-bucket}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-east-1
+        awslogs-group: riq-prod
+        awslogs-stream: minio
+        awslogs-create-group: "true"
+
   cache:
     image: redis:7.4-alpine
-    restart: always
+    restart: unless-stopped
     ports:
       - "6379:6379"
     command: redis-server --save "" --appendonly no
@@ -283,6 +316,7 @@ services:
 volumes:
   db_volume:
   vespa_volume:
+  minio_data:
   model_cache_huggingface:
   indexing_huggingface_model_cache:
   # for logs that we don't want to lose on container restarts
